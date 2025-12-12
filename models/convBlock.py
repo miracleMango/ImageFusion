@@ -50,7 +50,7 @@ class Block(nn.Module):
     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
         super().__init__()
         # 分组卷积（组内交互）
-        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=8, padding_mode="replicate")
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=1, padding_mode="replicate")
         # 新增1x1点卷积（组间交互，关键修复）
         self.point_conv = nn.Conv2d(dim, dim, kernel_size=1, padding=0)  # 无分组，全通道交互
         self.norm = LayerNorm(dim, eps=1e-6)

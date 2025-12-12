@@ -32,8 +32,8 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         # 3. 融合分支的交叉注意力模块（传入fusion分支的源图像通道）
         self.cross_attn_fusion = MultiHeadCrossAttentionFusionWithSourcePE(
             feature_channels, num_heads, use_position_encoding=use_position_encoding,
-            src_qk_channels=ir_img_channels + vis_img_channels,  # qk是ir+vis拼接（1+3=4通道）
-            src_v_channels=vis_img_channels  # v是ir转3通道+vis平均（3通道）
+            src_kv_channels=ir_img_channels + vis_img_channels,  # kv是ir+vis拼接（1+3=4通道）
+            src_q_channels=vis_img_channels  # q是ir转3通道+vis平均（3通道）
         )
 
         # 4. Final Layer（原逻辑保留）
@@ -143,7 +143,7 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
                                         align_corners=False)  # [B,3,h,w]
 
         # 融合分支qk的源图像：拼接（1+3=4通道）
-        source_fusion_qk = torch.cat([source_ir_down, source_vis_down], dim=1)  # [B,4,h,w]
+        source_fusion_kv = torch.cat([source_ir_down, source_vis_down], dim=1)  # [B,4,h,w]
 
         # 交叉注意力交互（原逻辑保留）
         attn_vis_out, _ = self.cross_attn_vis(
@@ -172,14 +172,14 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
 
         # 融合分支v的源图像：红外1通道转3通道后和可见光平均（核心修改）
         source_ir_down_3ch = torch.cat([source_ir_down, source_ir_down, source_ir_down], dim=1)  # 1→3通道
-        source_fusion_v = (source_ir_down_3ch + source_vis_down) / 2  # [B,3,h,w]
+        source_fusion_q = (source_ir_down_3ch + source_vis_down) / 2  # [B,3,h,w]
         # ========== 新增：调试融合源图像的RGB分布 ==========
         if self.debug_step < self.max_debug_steps:
-            print_channel_distribution(source_fusion_v, "融合源图像(RGB)", self.debug_step, is_rgb=True)
+            print_channel_distribution(source_fusion_q, "融合源图像(RGB)", self.debug_step, is_rgb=True)
 
         attn_fusion_out, _ = self.cross_attn_fusion(
-            fir_fvis_concat, fir_fvis_concat, ffusion,
-            source_fusion_qk, source_fusion_qk, source_fusion_v
+            ffusion, fir_fvis_concat, fir_fvis_concat,
+            source_fusion_q, source_fusion_kv, source_fusion_kv
         )
         self._debug_print(attn_fusion_out, "融合注意力输出", self.debug_step)
 

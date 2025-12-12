@@ -1,0 +1,52 @@
+name: cv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - h5py
+  - tqdm
+  - pyyaml
+  - openssl
+  - cryptography
+  - requests
+  - pyparsing
+  - pillow
+  - pip:
+      # 关键修改：从PyTorch官方源安装适配CUDA 12.4的版本
+      - torch==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124
+      - torchaudio==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124
+      - torchvision==0.21.0 --extra-index-url https://download.pytorch.org/whl/cu124
+      - torchinfo==1.8.0
+      - opencv-python==4.5.5.64
+      - kornia==0.8.2
+      - kornia-rs==0.1.10
+      - matplotlib==3.9.4
+      - tensorboard==2.17.0
+      - tensorboardx==2.5.1
+      - onnx==1.11.0
+      - protobuf==3.20.1
+      - openpyxl==3.0.10
+      - pywavelets==1.3.0
+      - thop==0.1.0-2206102148
+      - setproctitle==1.2.3
+      - contourpy==1.3.0
+      - et-xmlfile==1.1.0
+      - filelock==3.19.1
+      - fsspec==2025.10.0
+      - importlib-resources==6.5.2
+      - jinja2==3.1.6
+      - markupsafe==3.0.3
+      - mpmath==1.3.0
+      - networkx==3.2.1
+      - shortuuid==1.0.9
+      - sympy==1.13.1
+      - typing-extensions==4.15.0
+      - tzdata==2025.2
+      - wand==0.6.7
+      - zipp==3.23.0
+prefix: /public/home/sby2025/miniconda3/envs/cv
