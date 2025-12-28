@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.FeatureExtractor import CNNFeatureExtractor, FusionFeatureExtractor
 from models.FinalLayer import FixedFinalLayer
-from models.crossAttn import MultiHeadCrossAttentionWithSourcePE, MultiHeadCrossAttentionFusionWithSourcePE
+from models.crossAttn import MultiHeadCrossAttentionWithSourcePE, MultiHeadSelfAttentionWithSourcePE
 from models.debug import print_channel_distribution
 from models.loss import Loss
 
@@ -17,26 +17,46 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         self.vis_extractor = CNNFeatureExtractor(vis_img_channels, feature_channels)
         self.fusion_extractor = FusionFeatureExtractor(feature_channels * 4, feature_channels)
 
-        # 2. 交叉注意力模块（显式传入源图像通道参数）
+        # 2. vis重建分支自注意力模块（q,k,v = fvis）
+        self.self_attn_vis = MultiHeadSelfAttentionWithSourcePE(
+            feature_channels, num_heads, use_position_encoding=use_position_encoding,
+            src_channels=vis_img_channels, num_blocks=3)
+
+        # 3. ir重建分支自注意力模块（q,k,v = fvis）
+        self.self_attn_ir = MultiHeadSelfAttentionWithSourcePE(
+            feature_channels, num_heads, use_position_encoding=use_position_encoding,
+            src_channels=ir_img_channels, num_blocks=3)
+
+        # 4. 融合分支自注意力模块（q,k,v = fvis）
+        self.self_attn_fusion = MultiHeadSelfAttentionWithSourcePE(
+            feature_channels, num_heads, use_position_encoding=False,
+            num_blocks=3)
+
+        # 5. vis重建分支交叉注意力模块（显式传入源图像通道参数）
         self.cross_attn_vis = MultiHeadCrossAttentionWithSourcePE(
             feature_channels, num_heads, use_position_encoding=use_position_encoding,
             src_q_channels=vis_img_channels, src_k_channels=vis_img_channels, src_v_channels=vis_img_channels
             # vis源图像3通道
         )
+
+        # 6. ir重建分支交叉注意力模块（显式传入源图像通道参数）
         self.cross_attn_ir = MultiHeadCrossAttentionWithSourcePE(
             feature_channels, num_heads, use_position_encoding=use_position_encoding,
             src_q_channels=ir_img_channels, src_k_channels=ir_img_channels, src_v_channels=ir_img_channels
             # ir源图像1通道
         )
 
-        # 3. 融合分支的交叉注意力模块（传入fusion分支的源图像通道）
-        self.cross_attn_fusion = MultiHeadCrossAttentionFusionWithSourcePE(
-            feature_channels, num_heads, use_position_encoding=use_position_encoding,
-            src_kv_channels=ir_img_channels + vis_img_channels,  # kv是ir+vis拼接（1+3=4通道）
-            src_q_channels=vis_img_channels  # q是ir转3通道+vis平均（3通道）
+        # 7. 融合分支的交叉注意力模块1（q = ffusion, k,v = fvis）
+        self.cross_attn_fusion_vis = MultiHeadCrossAttentionWithSourcePE(
+            feature_channels, num_heads, use_position_encoding=False
         )
 
-        # 4. Final Layer（原逻辑保留）
+        # 8. 融合分支的交叉注意力模块2（q = ffusion, k,v = fvir）
+        self.cross_attn_fusion_ir = MultiHeadCrossAttentionWithSourcePE(
+            feature_channels, num_heads, use_position_encoding=False
+        )
+
+        # 9. Final Layer（原逻辑保留）
         self.final_vis = FixedFinalLayer(
             in_channels=feature_channels * 2,
             out_channels=vis_img_channels,
@@ -48,12 +68,12 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
             source_img_channels=ir_img_channels
         )
         self.final_fusion = FixedFinalLayer(
-            in_channels=feature_channels * 2,
+            in_channels=feature_channels * 4,
             out_channels=vis_img_channels,
             source_img_channels=vis_img_channels
         )
 
-        # 5. 损失函数
+        # 10. 损失函数
         self.compute_loss = Loss(device="cuda" if torch.cuda.is_available() else "cpu")
 
         # 调试计数器
@@ -124,10 +144,10 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
             print_channel_distribution(fvis, "VIS特征提取后", self.debug_step)  # 特征通道前3模拟RGB
 
         # 特征增强（原逻辑保留）
-        fir_enhanced = self._enhance_ir_features(fir, fvis)
-        fvis_enhanced = self._enhance_vis_features(fvis, fir)
+        fir = self._enhance_ir_features(fir, fvis)
+        fvis = self._enhance_vis_features(fvis, fir)
 
-        fvis_concat = torch.cat([fir_enhanced, fvis_enhanced], dim=1)
+        fvis_concat = torch.cat([fir, fvis], dim=1)
         ffusion = self.fusion_extractor(fvis_concat)
 
         self._debug_print(fvis_concat, "特征拼接", self.debug_step)
@@ -145,7 +165,22 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         # 融合分支qk的源图像：拼接（1+3=4通道）
         source_fusion_kv = torch.cat([source_ir_down, source_vis_down], dim=1)  # [B,4,h,w]
 
-        # 交叉注意力交互（原逻辑保留）
+        # vis自注意力模块
+        fvis, _=self.self_attn_vis(
+            fvis, source_vis_down
+        )
+
+        # ir自注意力模块
+        fir, _=self.self_attn_ir(
+            fir, source_ir_down
+        )
+
+        # vis自注意力模块
+        ffusion, _=self.self_attn_fusion(
+            ffusion
+        )
+
+        # 交叉注意力交互（q = fvis, k/v = ffusion）
         attn_vis_out, _ = self.cross_attn_vis(
             fvis, ffusion, ffusion,
             source_vis_down, source_vis_down, source_vis_down
@@ -158,6 +193,7 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         if self.debug_step < self.max_debug_steps:
             print_channel_distribution(img_vis_pred, "重建可见光(RGB)", self.debug_step, is_rgb=True)
 
+        #交叉注意力交互（q = fir, k/v = ffusion）
         attn_ir_out, _ = self.cross_attn_ir(
             fir, ffusion, ffusion,
             source_ir_down, source_ir_down, source_ir_down
@@ -167,9 +203,6 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         img_ir_pred = self.final_ir(attn_ir_out, source_img=img_ir)
         self._debug_print(img_ir_pred, "最终IR重建", self.debug_step)
 
-        # 融合分支：拼接fir和fvis作为q和k
-        fir_fvis_concat = torch.cat([fir, fvis], dim=1)
-
         # 融合分支v的源图像：红外1通道转3通道后和可见光平均（核心修改）
         source_ir_down_3ch = torch.cat([source_ir_down, source_ir_down, source_ir_down], dim=1)  # 1→3通道
         source_fusion_q = (source_ir_down_3ch + source_vis_down) / 2  # [B,3,h,w]
@@ -177,10 +210,18 @@ class ImageFusionNetworkWithSourcePE(nn.Module):
         if self.debug_step < self.max_debug_steps:
             print_channel_distribution(source_fusion_q, "融合源图像(RGB)", self.debug_step, is_rgb=True)
 
-        attn_fusion_out, _ = self.cross_attn_fusion(
-            ffusion, fir_fvis_concat, fir_fvis_concat,
-            source_fusion_q, source_fusion_kv, source_fusion_kv
+        #交叉注意力交互（q = ffusion, k/v = fvis）
+        attn_fusion_out_vis, _ = self.cross_attn_fusion_vis(
+            ffusion, attn_vis_out, attn_vis_out
         )
+
+        #交叉注意力交互（q = ffusion, k/v = fir）
+        attn_fusion_out_ir, _ = self.cross_attn_fusion_ir(
+            ffusion, attn_ir_out, attn_ir_out
+        )
+
+        attn_fusion_out = torch.cat([attn_fusion_out_vis, attn_fusion_out_ir], dim=1)
+
         self._debug_print(attn_fusion_out, "融合注意力输出", self.debug_step)
 
         # 融合源图像：红外转3通道后和可见光平均
