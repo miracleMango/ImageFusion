@@ -4,8 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# 保持原有ResidualCrossAttentionBlock完全不变
 class ResidualCrossAttentionBlock(nn.Module):
-    """通用的残差交叉注意力块"""
+    """通用的残差交叉注意力块（未做任何修改）"""
     def __init__(self, hidden_size, num_heads=8, dropout=0.1, 
                  q_channels=None, k_channels=None, v_channels=None):
         """
@@ -127,6 +128,7 @@ class ResidualCrossAttentionBlock(nn.Module):
         return output
 
 
+# 原有交叉注意力外层模块（保持不变）
 class MultiHeadCrossAttentionWithSourcePE(nn.Module):
     def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True,
                  src_q_channels=1, src_k_channels=1, src_v_channels=1, num_blocks=3):
@@ -172,7 +174,7 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size * 2)
         self.final_dropout = nn.Dropout(dropout)
         
-    def forward(self, fq, fk, fv, source_img_q, source_img_k, source_img_v):
+    def forward(self, fq, fk, fv, source_img_q = None, source_img_k = None, source_img_v = None):
         # 保存原始输入用于最终残差连接
         original_input = fq.clone()
         
@@ -208,82 +210,91 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
         return fq, intermediate_outputs if self.training else None
 
 
-class MultiHeadCrossAttentionFusionWithSourcePE(nn.Module):
+# 新增：自注意力外层模块（参考crossattn模块结构，仅修改forward逻辑）
+class MultiHeadSelfAttentionWithSourcePE(nn.Module):
+    """自注意力外层模块（基于ResidualCrossAttentionBlock实现，q=k=v）"""
     def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True,
-                 src_kv_channels=4, src_q_channels=3, num_blocks=3):
+                 src_channels=1, num_blocks=3):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.use_position_encoding = use_position_encoding
         self.num_blocks = num_blocks
         
-        # 位置编码（所有块共享）
+        # 自注意力：q/k/v共享同一个位置编码
         if use_position_encoding:
-            self.pos_encoding_q = SourcePositionalEncoding2D(src_q_channels, hidden_size * 2)
-            self.pos_encoding_k = SourcePositionalEncoding2D(src_kv_channels, hidden_size * 4)
-            self.pos_encoding_v = SourcePositionalEncoding2D(src_kv_channels, hidden_size * 4)
+            self.pos_encoding = SourcePositionalEncoding2D(src_channels, hidden_size * 2)
         else:
-            self.pos_encoding_q = None
-            self.pos_encoding_k = None
-            self.pos_encoding_v = None
+            self.pos_encoding = None
         
-        # 创建多个残差注意力块
+        # 创建多个残差注意力块（复用原有ResidualCrossAttentionBlock）
         self.blocks = nn.ModuleList()
         for _ in range(num_blocks):
             block = ResidualCrossAttentionBlock(
                 hidden_size=hidden_size,
                 num_heads=num_heads,
                 dropout=dropout,
-                q_channels=hidden_size * 2,      # fq的通道数
-                k_channels=hidden_size * 4,      # fk的通道数
-                v_channels=hidden_size * 4       # fv的通道数
+                q_channels=hidden_size * 2,
+                k_channels=hidden_size * 2,
+                v_channels=hidden_size * 2
             )
             
-            # 设置位置编码（所有块共享相同的位置编码）
+            # 自注意力：q/k/v共享同一个位置编码
             if use_position_encoding:
                 block.set_position_encodings(
-                    self.pos_encoding_q,
-                    self.pos_encoding_k,
-                    self.pos_encoding_v
+                    self.pos_encoding,  # q的位置编码
+                    self.pos_encoding,  # k的位置编码（和q相同）
+                    self.pos_encoding   # v的位置编码（和q相同）
                 )
             
             self.blocks.append(block)
         
-        # 最终的归一化和dropout
+        # 最终的归一化和dropout（和crossattn模块保持一致）
         self.final_norm = nn.LayerNorm(hidden_size * 2)
         self.final_dropout = nn.Dropout(dropout)
         
-    def forward(self, fq, fk, fv, source_img_q, source_img_k, source_img_v):
+    def forward(self, x, source_img=None):
+        """
+        自注意力前向传播：q=k=v=x
+        参数：
+        - x: 输入张量，形状 (batch_size, c, h, w)
+        - source_img: 位置编码所需的原始图像，可选
+        返回：
+        - output: 输出张量（形状与x完全一致）
+        - intermediate_outputs: 训练时返回中间块输出，测试时返回None
+        """
         # 保存原始输入用于最终残差连接
-        original_input = fq.clone()
+        original_input = x.clone()
         
         # 存储中间特征（可选）
         intermediate_outputs = []
         
-        # 逐个处理残差块
+        # 逐个处理残差块：自注意力核心逻辑（fq=fk=fv=x）
         for i, block in enumerate(self.blocks):
-            fq = block(
-                fq, fk, fv, 
-                source_img_q, source_img_k, source_img_v,
+            x = block(
+                fq=x, fk=x, fv=x,  # 关键：q=k=v=x
+                source_img_q=source_img, 
+                source_img_k=source_img, 
+                source_img_v=source_img,
                 use_position_encoding=self.use_position_encoding
             )
             
             # 保存中间输出（如果需要）
             if self.training:
-                intermediate_outputs.append(fq.clone())
+                intermediate_outputs.append(x.clone())
         
-        # 最终归一化
-        batch_size, c, h, w = fq.shape
+        # 最终归一化（和crossattn模块逻辑一致）
+        batch_size, c, h, w = x.shape
         seq_len = h * w
         
-        fq_seq = fq.reshape(batch_size, c, seq_len).permute(0, 2, 1)
-        fq_seq = self.final_norm(fq_seq)
-        fq = fq_seq.permute(0, 2, 1).reshape(batch_size, c, h, w)
+        x_seq = x.reshape(batch_size, c, seq_len).permute(0, 2, 1)
+        x_seq = self.final_norm(x_seq)
+        x = x_seq.permute(0, 2, 1).reshape(batch_size, c, h, w)
         
         # 最终的全局残差连接
-        fq = fq + original_input
+        x = x + original_input
         
         # 最终的dropout
-        fq = self.final_dropout(fq)
+        x = self.final_dropout(x)
         
-        return fq, intermediate_outputs if self.training else None
+        return x, intermediate_outputs if self.training else None
