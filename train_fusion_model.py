@@ -20,14 +20,17 @@ import torchvision.utils as vutils
 from datetime import datetime
 
 from models.model import ImageFusionNetworkWithSourcePE
+# ======================== 新增：导入自定义Loss类 ========================
+from models.loss import Loss  # 确保loss.py和训练代码同目录，或替换为你的Loss类路径
 
 warnings.filterwarnings('ignore')
 
-# ======================== 全局配置（删除Excel相关，新增加速/TensorBoard相关） ========================
+# ======================== 全局配置（新增显著性目录） ========================
 # 数据相关
 DATA_ROOT = "./datasets/M3FD_Fusion_Patches_3900_128"
+SALIENCY_ROOT = "./datasets/M3FD_Fusion_Saliency_Patches_3900_128"  # 新增：显著性图根目录
 IMG_SIZE = (128, 128)
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 IMG_SUFFIX = [".png", ".jpg", ".jpeg", ".bmp"]
 
 # 模型相关
@@ -60,7 +63,7 @@ RESUME_PATH = "./saved_models/latest_epoch_20.pth"
 TB_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
 TB_LOG_DIR = f"./runs/fusion_train_{TB_TIMESTAMP}"
 
-# ======================== 数据范围调试函数（仅保留终端输出） ========================
+# ======================== 数据范围调试函数（无修改） ========================
 def debug_data_range(dataloader, num_batches=3):
     """调试数据范围，仅终端输出"""
     print("\n" + "=" * 60)
@@ -130,23 +133,25 @@ def debug_data_range(dataloader, num_batches=3):
     print("=" * 60 + "\n")
 
 
-def debug_model_outputs(model, dataloader, device):
-    """调试模型输出范围，仅终端输出"""
-    print("\n" + "=" * 60)
-    print("模型输出范围调试")
-    print("=" * 60)
-
+def debug_model_outputs(model, dataloader, loss_module, device):
+    """调试模型输出范围"""
     model.eval()
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             if batch_idx >= 2:
                 break
-
+                
             img_ir = batch["ir"].to(device)
             img_vis = batch["vis"].to(device)
-
+            saliency_identifiers = batch["filename"]  # 获取所有标识
+            
             outputs = model(img_ir, img_vis)
-
+            targets = {"img_vis": img_vis, "img_ir": img_ir}
+            
+            # 传递显著性标识列表
+            losses = loss_module.forward(outputs, targets, saliency_identifiers)
+            
+            print(f"Batch {batch_idx + 1}:")
             print(f"Batch {batch_idx + 1}:")
             print(f"  输入IR范围: [{img_ir.min().item():.3f}, {img_ir.max().item():.3f}]")
             print(f"  输入VIS范围: [{img_vis.min().item():.3f}, {img_vis.max().item():.3f}]")
@@ -162,6 +167,7 @@ def debug_model_outputs(model, dataloader, device):
             vis_brightness_diff = outputs['img_vis_pred'].mean() - img_vis.mean()
 
             print(f"  亮度差异 - IR: {ir_brightness_diff.item():.3f}, VIS: {vis_brightness_diff.item():.3f}")
+            print(f"  当前批次总损失: {losses['total_loss'].item():.4f}")
 
             if abs(ir_brightness_diff) > 0.1 or abs(vis_brightness_diff) > 0.1:
                 print("  ⚠️  检测到亮度偏高问题!")
@@ -282,12 +288,21 @@ def init_tb_writer():
     return writer
 
 
-# ======================== 训练类（核心修改：删除Excel，集成TensorBoard，简化日志） ========================
+# ======================== 训练类（核心修改：适配新Loss类） ========================
 class FusionTrainer:
     def __init__(self, model, dataloader, logger):
         self.model = model.to(DEVICE)
         self.dataloader = dataloader
         self.logger = logger
+
+        # ======================== 新增：初始化自定义Loss模块 ========================
+        self.loss_module = Loss(
+            device=DEVICE,
+            saliency_root=SALIENCY_ROOT,  # 预计算显著性图根目录
+            grad_loss_type='l1',
+            grad_reduction='mean'
+        )
+        self.logger.info(f"✅ 自定义Loss模块初始化完成，显著性目录：{SALIENCY_ROOT}")
 
         # 梯度累积配置
         self.use_grad_accum = USE_GRAD_ACCUM
@@ -334,11 +349,7 @@ class FusionTrainer:
 
         # ======================== 初始化TensorBoard ========================
         self.tb_writer = init_tb_writer()
-        # 可视化模型结构
-        #dummy_ir = torch.randn(1, IR_IMG_CHANNELS, IMG_SIZE[0], IMG_SIZE[1]).to(DEVICE)
-        #dummy_vis = torch.randn(1, VIS_IMG_CHANNELS, IMG_SIZE[0], IMG_SIZE[1]).to(DEVICE)
-        #self.tb_writer.add_graph(self.model, (dummy_ir, dummy_vis))
-        #self.logger.info("✅ 模型结构图已写入TensorBoard")
+        # 可视化模型结构（跳过，避免字典输出报错）
         self.logger.info("✅ 跳过模型结构图可视化（避免字典输出trace报错）")
 
     def _load_checkpoint(self, path):
@@ -402,6 +413,13 @@ class FusionTrainer:
     def train_one_epoch(self, epoch):
         self.model.train()
         total_loss = 0.0
+        # 新增：累计各细分损失
+        loss_metrics = {
+            "l1_vis": 0.0, "l1_ir": 0.0, "grad_loss": 0.0,
+            "perceptual_loss": 0.0, "style_loss": 0.0, "pvs_loss": 0.0,
+            "gradloss": 0.0, "intloss": 0.0, "maxintloss": 0.0,
+            "color_loss": 0.0
+        }
 
         pbar = tqdm(self.dataloader, desc=f"Epoch [{epoch}/{EPOCHS}]")
         self.optimizer.zero_grad()
@@ -409,12 +427,15 @@ class FusionTrainer:
         for batch_idx, batch in enumerate(pbar):
             img_ir = batch["ir"].to(DEVICE, non_blocking=True)
             img_vis = batch["vis"].to(DEVICE, non_blocking=True)
+            # 关键：获取显著性标识（每个batch的第一个样本标识，或批量处理）
+            saliency_identifiers = batch["filename"]  # 使用整个batch的标识列表
 
             # 混合精度前向传播
             with autocast(enabled=USE_MIXED_PRECISION):
                 outputs = self.model(img_ir, img_vis)
                 targets = {"img_vis": img_vis, "img_ir": img_ir}
-                losses = self.model.compute_loss(outputs, targets)
+                # 核心修改：调用自定义Loss计算损失，传递显著性标识
+                losses = self.loss_module.forward(outputs, targets, saliency_identifiers)
 
                 # 梯度累积损失调整
                 loss = losses["total_loss"] / self.grad_accum_steps if self.use_grad_accum else losses["total_loss"]
@@ -456,25 +477,16 @@ class FusionTrainer:
                 "grad_accum": f"{self.use_grad_accum}"
             })
 
-        # 计算平均损失
+        # 计算epoch平均损失
         avg_loss = total_loss / len(self.dataloader)
+        avg_metrics = {k: v / len(self.dataloader) for k, v in loss_metrics.items()}
         current_lr = self.optimizer.param_groups[0]['lr']
 
-        # ======================== 写入TensorBoard（核心可视化） ========================
-        # 总损失
+        # 写入TensorBoard（使用平均损失）
         self.tb_writer.add_scalar("Loss/Total_Loss", avg_loss, epoch)
-        # 细分损失
-        self.tb_writer.add_scalar("Loss/L1_Vis", losses["l1_vis"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/L1_Ir", losses["l1_ir"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/Grad_Loss", losses["grad_loss"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/Gradloss", losses["gradloss"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/Intloss", losses["intloss"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/Perceptual_Loss", losses["perceptual_loss"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/Style_Loss", losses["style_loss"].item(), epoch)
-        self.tb_writer.add_scalar("Loss/PVS_Loss", losses["pvs_loss"].item(), epoch)
-        # 学习率
+        for k, v in avg_metrics.items():
+            self.tb_writer.add_scalar(f"Loss/{k}", v, epoch)
         self.tb_writer.add_scalar("Optimizer/Learning_Rate", current_lr, epoch)
-
         self.scheduler.step()
         return avg_loss
 
@@ -482,6 +494,7 @@ class FusionTrainer:
         self.logger.info("=" * 50)
         self.logger.info(f"训练开始！设备：{DEVICE}，批次大小：{BATCH_SIZE}，总轮次：{EPOCHS}")
         self.logger.info(f"模型参数：特征通道数={FEATURE_CHANNELS}，注意力头数={NUM_HEADS}")
+        self.logger.info(f"显著性图目录：{os.path.abspath(SALIENCY_ROOT)}")
         self.logger.info(f"TensorBoard日志路径：{os.path.abspath(TB_LOG_DIR)}")
         self.logger.info("=" * 50)
 
@@ -498,7 +511,7 @@ class FusionTrainer:
         self.logger.info("=" * 50)
 
 
-# ======================== 入口函数 ========================
+# ======================== 入口函数（修改调试函数调用） ========================
 if __name__ == "__main__":
     # 初始化日志
     logger = init_logger()
@@ -509,6 +522,7 @@ if __name__ == "__main__":
     for batch in dataloader:
         print("验证img_ir通道数：", batch["ir"].shape)
         print("验证img_vis通道数：", batch["vis"].shape)
+        print("验证filename标识：", batch["filename"][0])
         break
 
     # 数据范围调试
@@ -526,12 +540,14 @@ if __name__ == "__main__":
     model = model.to(DEVICE)
     print(f"模型已移动到设备: {DEVICE}")
 
-    # 重置调试计数器
-    model.debug_step = 0
+    # 初始化Loss模块用于调试
+    loss_module = Loss(
+        device=DEVICE,
+        saliency_root=SALIENCY_ROOT,
+    )
 
-    # 模型输出调试
-    debug_model_outputs(model, dataloader, DEVICE)
-    model.debug_step = 0
+    # 模型输出调试（传入Loss模块）
+    debug_model_outputs(model, dataloader, loss_module, DEVICE)
 
     # 启动训练
     trainer = FusionTrainer(model, dataloader, logger)
