@@ -3,54 +3,95 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.convBlock import EnhancedAttention, Block
 
-class CNNFeatureExtractor(nn.Module):
+class CNNFeatureExtractorWithGlobal(nn.Module):
+    """改造后的Patch特征提取器：融入全局+位置特征，不修改原有核心逻辑"""
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, drop_path=0.):
         super().__init__()
-        # 优化通道扩展策略
+        # 完全复用原有初始化逻辑（不修改核心代码）
+        self.out_channels = out_channels
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, padding_mode="replicate")
         self.bn1 = nn.BatchNorm2d(out_channels)
 
-        # 第1个下采样阶段（stage1）：通道=out_channels，尺寸减半
         self.downsample1 = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1, padding_mode="replicate"),
             nn.BatchNorm2d(out_channels)
         )
-        # 加深：stage1堆叠4个Block（原2个）
         self.stage1 = nn.Sequential(*[Block(dim=out_channels, drop_path=drop_path) for _ in range(4)])
 
-        # 第2个下采样阶段（stage2）：通道=2*out_channels，尺寸再减半
         self.conv2 = nn.Conv2d(out_channels, out_channels * 2, 3, padding=1, padding_mode="replicate")
         self.bn2 = nn.BatchNorm2d(out_channels * 2)
         self.downsample2 = nn.Sequential(
             nn.Conv2d(out_channels * 2, out_channels * 2, 3, stride=2, padding=1, padding_mode="replicate"),
             nn.BatchNorm2d(out_channels * 2)
         )
-        # 加深：stage2堆叠6个Block（原2个）
         self.stage2 = nn.Sequential(*[Block(dim=out_channels * 2, drop_path=drop_path) for _ in range(6)])
 
-        # 最终通道调整+SE
         self.conv_final = nn.Conv2d(out_channels * 2, out_channels * 2, 1, padding_mode="replicate")
         self.se_post = EnhancedAttention(in_channels=out_channels * 2)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=False)
+        
+        # 新增：全局特征融合层（匹配两个关键节点的特征维度）
+        # 节点1：stage1输出后（维度=out_channels）
+        self.fusion_stage1 = nn.Sequential(
+            nn.Linear(out_channels * 2, out_channels),  # 全局特征维度→stage1输出维度
+            nn.LayerNorm(out_channels)
+        )
+        # 节点2：stage2输出后（维度=out_channels*2）
+        self.fusion_stage2 = nn.LayerNorm(out_channels * 2)
 
-    def forward(self, x):
-        # stage1：下采样+4个Block
+    def _broadcast_global_feat(self, global_feat, patch_feat_shape):
+        """
+        全局特征向量→空间广播为patch特征图形状，适配融合
+        input：global_feat [B, C]，patch_feat_shape [B, C_patch, Hp, Wp]
+        output：broadcast_feat [B, C_patch, Hp, Wp]
+        """
+        B, C_patch, Hp, Wp = patch_feat_shape
+        global_feat = global_feat.view(B, -1, 1, 1)  # [B, C, 1, 1]
+        broadcast_feat = global_feat.expand(B, C_patch, Hp, Wp)  # 空间广播
+        return broadcast_feat
+
+    def forward(self, x, global_pos_feat):
+        """
+        输入：
+            x - patch图像（ir/vis模态，[B, in_channels, Hp, Wp]）
+            global_pos_feat - 融入位置信息的全局特征（[B, out_channels*2]）
+        输出：
+            x - 融入全局信息的patch特征（[B, out_channels*2, Hp//4, Wp//4]）
+        """
+        # ---------------------- 原有逻辑：stage1  ----------------------
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.downsample1(x)
-        x = self.stage1(x)
-
-        # stage2：通道扩展+下采样+6个Block
+        x = self.stage1(x)  # stage1输出：[B, out_channels, Hp//2, Wp//2]
+        
+        # ---------------------- 新增：第一个融合节点（stage1后） ----------------------
+        # 1. 全局特征映射到stage1输出维度
+        global_feat_stage1 = self.fusion_stage1(global_pos_feat)
+        # 2. 空间广播适配patch特征形状
+        broadcast_feat_stage1 = self._broadcast_global_feat(global_feat_stage1, x.shape)
+        # 3. 特征融合（逐元素相加，残差连接，不破坏原有patch特征）
+        x = x + self.relu(broadcast_feat_stage1)
+        
+        # ---------------------- 原有逻辑：stage2  ----------------------
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu(x)
         x = self.downsample2(x)
-        x = self.stage2(x)
-
-        # 最终调整
+        x = self.stage2(x)  # stage2输出：[B, out_channels*2, Hp//4, Wp//4]
+        
+        # ---------------------- 新增：第二个融合节点（stage2后） ----------------------
+        # 1. 全局特征层归一化（匹配stage2输出维度）
+        global_feat_stage2 = self.fusion_stage2(global_pos_feat)
+        # 2. 空间广播适配patch特征形状
+        broadcast_feat_stage2 = self._broadcast_global_feat(global_feat_stage2, x.shape)
+        # 3. 特征融合（逐元素相加，残差连接）
+        x = x + self.relu(broadcast_feat_stage2)
+        
+        # ---------------------- 原有逻辑：最终调整  ----------------------
         x = self.conv_final(x)
         x = self.se_post(x)
+        
         return x
 
 class FusionFeatureExtractor(nn.Module):
