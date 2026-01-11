@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torchvision
 import math
 import os
-import cv2
 import numpy as np
 
 def gaussian_blur_manual(x, kernel_size, sigma):
@@ -22,14 +21,10 @@ def gaussian_blur_manual(x, kernel_size, sigma):
         dtype = x.dtype
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
-        if isinstance(sigma, (int, float)):
-            sigma = (sigma, sigma)
-        
-        # 计算高斯核
         kernel_x = torch.arange(kernel_size[0], device=device, dtype=dtype) - kernel_size[0] // 2
         kernel_y = torch.arange(kernel_size[1], device=device, dtype=dtype) - kernel_size[1] // 2
-        kernel_x = torch.exp(-kernel_x.pow(2) / (2 * sigma[0] **2))
-        kernel_y = torch.exp(-kernel_y.pow(2) / (2 * sigma[1]** 2))
+        kernel_x = torch.exp(-kernel_x.pow(2) / (2 * sigma[0] ** 2))
+        kernel_y = torch.exp(-kernel_y.pow(2) / (2 * sigma[1] ** 2))
         kernel = kernel_x.unsqueeze(1) * kernel_y.unsqueeze(0)  # 外积生成2D核
         kernel = kernel / kernel.sum()  # 归一化
         
@@ -45,8 +40,7 @@ def gaussian_blur_manual(x, kernel_size, sigma):
 class Loss(nn.Module):
     def __init__(self,
                  device,
-                 # 新增：预计算显著性图根目录（解压后的目录）
-                 saliency_root="./datasets/M3FD_Fusion_Saliency_Patches_3900_128",
+                 # 移除：saliency_root相关配置（不再从本地加载）
                  # 基础损失权重
                  lambda_vis=1.0,
                  lambda_ir=1.0,
@@ -59,15 +53,12 @@ class Loss(nn.Module):
                  lambda_intloss=0,
                  lambda_maxintloss=1.0,
                  # ========== 新增：Color Loss权重 ==========
-                 lambda_color=1.0,
+                 lambda_color=5.0,
                  # GradientLoss相关参数
                  grad_loss_type='l1',
                  grad_reduction='mean'):
         super().__init__()
         self.device = device
-        # 新增：显著性文件根目录
-        self.saliency_root = saliency_root
-        os.makedirs(self.saliency_root, exist_ok=True)
 
         # ========== 损失权重配置（新增lambda_color） ==========
         self.lambda_dict = {
@@ -133,7 +124,7 @@ class Loss(nn.Module):
 
     def _compute_color_loss(self, pred_fusion, target_vis):
         """
-        计算颜色一致性损失：融合图像与可见光图像的Cb/Cr通道L1距离
+        计算颜色一致性损失：融合图像与可见光图像的CbCr通道差异
         Args:
             pred_fusion: [B, C, H, W]，融合图像，数值范围[-1,1]
             target_vis: [B, C, H, W]，可见光图像，数值范围[-1,1]
@@ -162,40 +153,10 @@ class Loss(nn.Module):
         
         # 6. 按公式计算平均损失：1/(HW) * 求和（Cb损失 + Cr损失）/2
         B, _, H, W = cb_loss.shape
-        total_pixels = H * W
-        color_loss = (cb_loss + cr_loss).sum() / (2 * B * total_pixels)
+        total_pixels = B * H * W
+        color_loss = (cb_loss.sum() + cr_loss.sum()) / (2 * total_pixels)
         
         return color_loss
-
-    # ========== 新增：加载预计算的显著性图 ==========
-    def _load_precomputed_saliency(self, saliency_identifier):
-        """
-        加载预计算的IR显著性Patch
-        :param saliency_identifier: 显著性文件标识（如：img001_patch_00_00）
-        :return: SR: 显著性张量 [B=1, 1, H, W]，值范围0~1
-        """
-        # 构造显著性文件路径
-        saliency_filename = f"{saliency_identifier}_saliency.png"
-        saliency_path = os.path.join(self.saliency_root, saliency_filename)
-        
-        # 检查文件是否存在
-        if not os.path.exists(saliency_path):
-            raise FileNotFoundError(f"预计算的显著性文件不存在：{saliency_path}")
-        
-        # 加载灰度图（单通道）
-        saliency_img = cv2.imread(saliency_path, cv2.IMREAD_GRAYSCALE)
-        if saliency_img is None:
-            raise ValueError(f"无法读取显著性文件：{saliency_path}")
-        
-        # 转为张量并适配维度/设备/数值范围
-        # 1. 转为float32，归一化到0~1
-        saliency_tensor = torch.from_numpy(saliency_img).float() / 255.0
-        # 2. 添加batch和通道维度 [H, W] → [1, 1, H, W]
-        saliency_tensor = saliency_tensor.unsqueeze(0).unsqueeze(0)
-        # 3. 移到指定设备
-        saliency_tensor = saliency_tensor.to(self.device)
-        
-        return saliency_tensor
 
     # ========== 原GradientLoss核心方法（不变） ==========
     def _compute_gradient(self, x, kernel):
@@ -255,51 +216,56 @@ class Loss(nn.Module):
             return torch.tensor(0.0, device=self.device)
         return F.l1_loss(pred_ir, target_ir)
 
-    def _compute_intloss(self, pred_fusion, target_vis, target_ir, saliency_identifiers):
+    def _compute_intloss(self, pred_fusion, target_vis, target_ir, saliency_tensor):
         """
-        批量处理显著性图，保证维度+数值范围双对齐
+        直接使用传入的saliency张量计算intloss，不再从本地加载文件
+        关键修改：
+        1. 入参替换为saliency_tensor（[B, 1, H, W]，范围[0,1]）
+        2. 移除批量加载文件的逻辑，直接处理传入的张量
+        3. 保留尺寸校验和resize，提升鲁棒性
         :param pred_fusion: 预测融合图像 [B, C, H, W]，范围[-1,1]
         :param target_vis: 目标可见光图像 [B, C, H, W]，范围[-1,1]
-        :param target_ir: 目标红外图像 [B, 1/H, W]，范围[-1,1]
-        :param saliency_identifiers: 批量显著性标识列表（长度=B）
+        :param target_ir: 目标红外图像 [B, 1, H, W]，范围[-1,1]
+        :param saliency_tensor: 显著性张量 [B, 1, H, W]，范围[0,1]（从Dataset同步传入）
         :return: intloss: 标量损失值
         """
-
-        # ========== 新增核心判断：lambda_intloss=0时直接返回0，不读取显著性图 ==========
+        # ========== 1. 权重为0时直接返回0 ==========
         if self.lambda_dict['intloss'] == 0:
-            return torch.tensor(0.0, device=self.device)  # 返回0张量（匹配设备）
+            return torch.tensor(0.0, device=self.device)
+        
         B, C, H, W = pred_fusion.shape
         
-        # ========== 1. 批量加载所有显著性图并校验维度 ==========
-        SR_list = []
-        for identifier in saliency_identifiers:
-            SR = self._load_precomputed_saliency(identifier)  # [1,1,H_sal, W_sal]
-            # 校验显著性图尺寸与输入图像一致
-            if SR.shape[2:] != (H, W):
-                # 自适应resize到当前图像尺寸（避免尺寸不匹配）
-                SR = F.interpolate(SR, size=(H, W), mode='bilinear', align_corners=False)
-            SR_list.append(SR)
-        SR = torch.cat(SR_list, dim=0)  # [B,1,H,W]，值范围[0,1]（来自加载的显著性图）
+        # ========== 2. 校验并适配saliency张量尺寸 ==========
+        SR = saliency_tensor.to(self.device, non_blocking=True)  # 确保设备对齐
+        # 校验尺寸：若与输入图像不一致，自适应resize
+        if SR.shape[2:] != (H, W):
+            SR = F.interpolate(SR, size=(H, W), mode='bilinear', align_corners=False)
+        # 确保通道数为1，形状为[B, 1, H, W]
+        if SR.shape[1] != 1:
+            SR = SR[:, 0:1, :, :]
         
-        # ========== 2. 计算可见光显著性权重 ==========
+        # ========== 3. 确保saliency张量数值范围为[0,1]（与原逻辑对齐） ==========
+        SR = torch.clamp(SR, 0.0, 1.0)
+        
+        # ========== 4. 计算可见光显著性权重 ==========
         SV = 1 - SR  # [B, 1, H, W]，值范围[0,1]
         
-        # ========== 3. 扩展权重到与图像相同的通道数 ==========
+        # ========== 5. 扩展权重到与图像相同的通道数 ==========
         omega_V_expanded = SV.repeat(1, C, 1, 1)  # [B, C, H, W]
         omega_R_expanded = SR.repeat(1, C, 1, 1)  # [B, C, H, W]
         
-        # ========== 4. 统一所有图像的数值范围（[-1,1] → [0,1]） ==========
+        # ========== 6. 统一所有图像的数值范围（[-1,1] → [0,1]） ==========
         pred_fusion = (pred_fusion + 1) / 2  # [B,C,H,W] → [0,1]
         target_vis = (target_vis + 1) / 2    # 关键：目标图也要归一化到[0,1]
         target_ir = (target_ir + 1) / 2      # 关键：红外图也要归一化到[0,1]
         
-        # ========== 5. 红外图像通道扩展（鲁棒版） ==========
+        # ========== 7. 红外图像通道扩展（鲁棒版） ==========
         if target_ir.shape[1] != C:
             target_ir_3ch = target_ir.repeat(1, C, 1, 1)  # [B,C,H,W]
         else:
             target_ir_3ch = target_ir  # 已匹配通道数，无需扩展
         
-        # ========== 6. 计算加权L1损失（维度完全对齐） ==========
+        # ========== 8. 计算加权L1损失（维度完全对齐） ==========
         loss_vis = F.l1_loss(omega_V_expanded * pred_fusion, omega_V_expanded * target_vis)
         loss_ir = F.l1_loss(omega_R_expanded * pred_fusion, omega_R_expanded * target_ir_3ch)
         intloss = loss_vis + loss_ir
@@ -372,32 +338,30 @@ class Loss(nn.Module):
         grad_loss_fusion = self._gradient_loss(pred_fusion, target_fusion)
         return grad_loss_vis + grad_loss_ir + grad_loss_fusion
 
-    # ========== 感知损失（不变） ==========
     def _compute_perceptual_loss(self, pred_vis, pred_ir, pred_fusion, targets):
-        """计算感知损失"""
+        """优化后的感知损失：仅保留fusion分支，删除vis/ir分支"""
         if self.lambda_dict['perceptual'] == 0 or self.vgg is None:
             return torch.tensor(0.0, device=self.device)
 
         target_vis = targets["img_vis"]
-        target_ir = targets["img_ir"]
-        target_fusion = target_vis
+        # 原逻辑中target_fusion直接复用target_vis（无监督下的伪参考）
+        target_fusion = target_vis  
 
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-
+        # 复用之前优化的_extract_vgg_feat函数（带no_grad+缓存）
         def _single_perceptual(pred, target):
             if pred.shape[1] != 3:
                 return torch.tensor(0.0, device=self.device)
-            pred_norm = (pred - mean) / std
-            target_norm = (target - mean) / std
-            pred_feat = self.vgg(pred_norm)
-            target_feat = self.vgg(target_norm)
+            pred_norm = (pred - self.vgg_mean) / self.vgg_std
+            target_norm = (target - self.vgg_mean) / self.vgg_std
+            with torch.no_grad():  # 关键：关闭梯度，避免冗余计算
+                pred_feat = self.vgg(pred_norm)
+                target_feat = self.vgg(target_norm)
             return F.l1_loss(pred_feat, target_feat)
 
-        perceptual_vis = _single_perceptual(pred_vis, target_vis)
-        perceptual_ir = _single_perceptual(pred_ir, target_ir)
+        # ========== 核心修改：仅计算fusion分支的感知损失 ==========
+        # 删掉perceptual_vis和perceptual_ir的计算，只保留fusion
         perceptual_fusion = _single_perceptual(pred_fusion, target_fusion)
-        return perceptual_vis + perceptual_ir + perceptual_fusion
+        return perceptual_fusion
 
     # ========== 风格损失（不变） ==========
     def _compute_style_loss(self, pred_fusion, targets):
@@ -462,8 +426,15 @@ class Loss(nn.Module):
 
         return torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 
-    # ========== 修改后的前向传播（新增color loss计算） ==========
-    def forward(self, outputs, targets, saliency_identifier):
+    # ========== 修改后的前向传播（接收saliency张量，不再加载文件） ==========
+    def forward(self, outputs, targets, saliency_tensor):
+        """
+        前向传播：直接使用传入的saliency张量计算损失
+        :param outputs: 模型输出字典
+        :param targets: 目标数据字典
+        :param saliency_tensor: 显著性张量 [B, 1, H, W]，范围[0,1]（从Dataset同步传入）
+        :return: 损失字典
+        """
         pred_vis = outputs["img_vis_pred"]
         pred_ir = outputs["img_ir_pred"]
         pred_fusion = outputs["img_fusion_pred"]
@@ -474,8 +445,8 @@ class Loss(nn.Module):
         l1_vis = self._compute_l1_vis(pred_vis, target_vis)
         l1_ir = self._compute_l1_ir(pred_ir, target_ir)
 
-        # 2. 调用修改后的方法计算intloss（传入显著性标识）
-        intloss = self._compute_intloss(pred_fusion, target_vis, target_ir, saliency_identifier)
+        # 2. 调用修改后的方法计算intloss（传入saliency张量，不再传文件名）
+        intloss = self._compute_intloss(pred_fusion, target_vis, target_ir, saliency_tensor)
         maxintloss = self._compute_maxintloss(pred_fusion, target_vis, target_ir)
         
         # 3. 计算gradloss
