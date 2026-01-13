@@ -9,8 +9,9 @@ from PIL import Image
 import logging
 from tqdm import tqdm
 import warnings
-import multiprocessing
+import multiprocessing  # 补充：添加这行导入，解决NameError
 import numpy as np
+import torchvision.transforms.functional as TF
 # ======================== 新增：混合精度训练依赖 ========================
 from torch.cuda.amp import autocast, GradScaler
 import torch.backends.cudnn as cudnn
@@ -18,20 +19,30 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 from datetime import datetime
+# ======================== 新增：分组打乱所需依赖 ========================
+from collections import defaultdict
+import random
+# ======================== 新增：OpenCV（提升图像加载速度，优化IO瓶颈） ========================
+import cv2
 
+# 注意：确保你的模型和Loss类路径正确
 from models.model import ImageFusionNetworkWithSourcePE
-# ======================== 新增：导入自定义Loss类 ========================
-from models.loss import Loss  # 确保loss.py和训练代码同目录，或替换为你的Loss类路径
+from models.loss import Loss
 
 warnings.filterwarnings('ignore')
 
-# ======================== 全局配置（新增显著性目录） ========================
+# ======================== 全局配置（核心新增：FIXED_FULL_SIZE 统一整图尺寸） ========================
 # 数据相关
 DATA_ROOT = "./datasets/M3FD_Fusion_Patches_3900_128"
-SALIENCY_ROOT = "./datasets/M3FD_Fusion_Saliency_Patches_3900_128"  # 新增：显著性图根目录
-IMG_SIZE = (128, 128)
-BATCH_SIZE = 32
+FULL_IMAGE_ROOT = "./datasets/M3FD_Fusion_3900"  # 整图根目录（存放ir/vis两个子文件夹）
+SALIENCY_ROOT = "./datasets/M3FD_Fusion_Saliency_Patches_3900_128"
+PATCH_SIZE = (128, 128)
+PATCH_STRIDE = 128
+BATCH_SIZE = 8
 IMG_SUFFIX = [".png", ".jpg", ".jpeg", ".bmp"]
+
+# 核心新增：统一整图尺寸（可根据需求调整，建议为2的幂次，如512、256）
+FIXED_FULL_SIZE = (512, 512)  # 固定整图为512×512，保持空间比例不变
 
 # 模型相关
 VIS_IMG_CHANNELS = 3
@@ -39,7 +50,6 @@ IR_IMG_CHANNELS = 1
 FEATURE_CHANNELS = 64
 NUM_HEADS = 16
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("当前使用的设备：", DEVICE)
 
 # 训练相关
 EPOCHS = 50
@@ -48,7 +58,6 @@ OPTIMIZER_TYPE = "AdamW"
 WEIGHT_DECAY = 1e-5
 SCHEDULER_T_MAX = 40
 SCHEDULER_ETA_MIN = 1e-6
-# 梯度累积配置
 USE_GRAD_ACCUM = False
 GRAD_ACCUM_STEPS = 4 if USE_GRAD_ACCUM else 1
 USE_MIXED_PRECISION = True if DEVICE == "cuda" else False
@@ -59,250 +68,432 @@ LOG_FILE = "./train.log"
 SAVE_FREQ = 5
 RESUME_TRAIN = False
 RESUME_PATH = "./saved_models/latest_epoch_20.pth"
-# TensorBoard配置
 TB_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
 TB_LOG_DIR = f"./runs/fusion_train_{TB_TIMESTAMP}"
 
-# ======================== 数据范围调试函数（无修改） ========================
-def debug_data_range(dataloader, num_batches=3):
-    """调试数据范围，仅终端输出"""
-    print("\n" + "=" * 60)
-    print("数据范围调试信息")
-    print("=" * 60)
-
-    ir_stats = {"min": [], "max": [], "mean": [], "std": []}
-    vis_stats = {"min": [], "max": [], "mean": [], "std": []}
-
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= num_batches:
-            break
-
-        img_ir = batch["ir"]
-        img_vis = batch["vis"]
-
-        # IR图像统计
-        ir_stats["min"].append(img_ir.min().item())
-        ir_stats["max"].append(img_ir.max().item())
-        ir_stats["mean"].append(img_ir.mean().item())
-        ir_stats["std"].append(img_ir.std().item())
-
-        # VIS图像统计
-        vis_stats["min"].append(img_vis.min().item())
-        vis_stats["max"].append(img_vis.max().item())
-        vis_stats["mean"].append(img_vis.mean().item())
-        vis_stats["std"].append(img_vis.std().item())
-
-        print(f"Batch {batch_idx + 1}:")
-        print(f"  IR  - 范围: [{img_ir.min().item():.3f}, {img_ir.max().item():.3f}], "
-              f"均值: {img_ir.mean().item():.3f}, 标准差: {img_ir.std().item():.3f}")
-        print(f"  VIS - 范围: [{img_vis.min().item():.3f}, {img_vis.max().item():.3f}], "
-              f"均值: {img_vis.mean().item():.3f}, 标准差: {img_vis.std().item():.3f}")
-
-    # 汇总统计
-    print("\n汇总统计:")
-    print(f"IR图像:")
-    print(f"  最小值范围: [{min(ir_stats['min']):.3f}, {max(ir_stats['min']):.3f}]")
-    print(f"  最大值范围: [{min(ir_stats['max']):.3f}, {max(ir_stats['max']):.3f}]")
-    print(f"  均值范围: [{min(ir_stats['mean']):.3f}, {max(ir_stats['mean']):.3f}]")
-    print(f"  标准差范围: [{min(ir_stats['std']):.3f}, {max(ir_stats['std']):.3f}]")
-
-    print(f"VIS图像:")
-    print(f"  最小值范围: [{min(vis_stats['min']):.3f}, {max(vis_stats['min']):.3f}]")
-    print(f"  最大值范围: [{min(vis_stats['max']):.3f}, {max(vis_stats['max']):.3f}]")
-    print(f"  均值范围: [{min(vis_stats['mean']):.3f}, {max(vis_stats['mean']):.3f}]")
-    print(f"  标准差范围: [{min(vis_stats['std']):.3f}, {max(vis_stats['std']):.3f}]")
-
-    # 判断数据范围类型并推荐激活函数
-    ir_min_global = min(ir_stats['min'])
-    ir_max_global = max(ir_stats['max'])
-    vis_min_global = min(vis_stats['min'])
-    vis_max_global = max(vis_stats['max'])
-
-    print(f"\n激活函数推荐:")
-    if ir_min_global >= -0.1 and ir_max_global <= 1.1 and vis_min_global >= -0.1 and vis_max_global <= 1.1:
-        print("  ✅ 数据在[0,1]范围内，推荐使用 Sigmoid 激活函数")
-        print("  ❌ 数据在[0,1]范围内，不推荐使用 Tanh 激活函数")
-    elif ir_min_global >= -1.1 and ir_max_global <= 1.1 and vis_min_global >= -1.1 and vis_max_global <= 1.1:
-        print("  ✅ 数据在[-1,1]范围内，推荐使用 Tanh 激活函数")
-        print("  ❌ 数据在[-1,1]范围内，不推荐使用 Sigmoid 激活函数")
-    else:
-        print("  ⚠️  数据范围异常，建议检查数据预处理")
-        print(f"  IR范围: [{ir_min_global:.3f}, {ir_max_global:.3f}]")
-        print(f"  VIS范围: [{vis_min_global:.3f}, {vis_max_global:.3f}]")
-
-    print("=" * 60 + "\n")
-
-
-def debug_model_outputs(model, dataloader, loss_module, device):
-    """调试模型输出范围"""
-    model.eval()
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            if batch_idx >= 2:
-                break
-                
-            img_ir = batch["ir"].to(device)
-            img_vis = batch["vis"].to(device)
-            saliency_identifiers = batch["filename"]  # 获取所有标识
-            
-            outputs = model(img_ir, img_vis)
-            targets = {"img_vis": img_vis, "img_ir": img_ir}
-            
-            # 传递显著性标识列表
-            losses = loss_module.forward(outputs, targets, saliency_identifiers)
-            
-            print(f"Batch {batch_idx + 1}:")
-            print(f"Batch {batch_idx + 1}:")
-            print(f"  输入IR范围: [{img_ir.min().item():.3f}, {img_ir.max().item():.3f}]")
-            print(f"  输入VIS范围: [{img_vis.min().item():.3f}, {img_vis.max().item():.3f}]")
-            print(
-                f"  重建IR范围: [{outputs['img_ir_pred'].min().item():.3f}, {outputs['img_ir_pred'].max().item():.3f}]")
-            print(
-                f"  重建VIS范围: [{outputs['img_vis_pred'].min().item():.3f}, {outputs['img_vis_pred'].max().item():.3f}]")
-            print(
-                f"  融合图像范围: [{outputs['img_fusion_pred'].min().item():.3f}, {outputs['img_fusion_pred'].max().item():.3f}]")
-
-            # 检查亮度问题
-            ir_brightness_diff = outputs['img_ir_pred'].mean() - img_ir.mean()
-            vis_brightness_diff = outputs['img_vis_pred'].mean() - img_vis.mean()
-
-            print(f"  亮度差异 - IR: {ir_brightness_diff.item():.3f}, VIS: {vis_brightness_diff.item():.3f}")
-            print(f"  当前批次总损失: {losses['total_loss'].item():.4f}")
-
-            if abs(ir_brightness_diff) > 0.1 or abs(vis_brightness_diff) > 0.1:
-                print("  ⚠️  检测到亮度偏高问题!")
-
-    print("=" * 60 + "\n")
-    model.train()
-
-
-# ======================== 红外/可见光Transform（无修改） ========================
+# ======================== Transform（核心修改：新增Saliency Transform + 整图统一尺寸） ========================
 def get_ir_transform():
+    """Patch的IR Transform（带数据增强，保持原有逻辑）"""
     return transforms.Compose([
-        transforms.Resize(IMG_SIZE),
-        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.Resize(PATCH_SIZE),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5], std=[0.5])
     ])
 
 
 def get_vis_transform():
+    """Patch的VIS Transform（带数据增强，保持原有逻辑）"""
     return transforms.Compose([
-        transforms.Resize(IMG_SIZE),
-        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.Resize(PATCH_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+
+def get_saliency_transform():
+    """Patch的Saliency Transform（与IR保持一致，保证预处理对齐）"""
+    return transforms.Compose([
+        transforms.Resize(PATCH_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+
+
+def get_ir_full_transform():
+    """IR 整图 Transform（核心修改：等比例缩放+居中裁剪，统一到FIXED_FULL_SIZE）"""
+    return transforms.Compose([
+        # 步骤1：等比例缩放，最短边达到固定尺寸，保持宽高比（避免拉伸）
+        transforms.Resize(FIXED_FULL_SIZE, interpolation=Image.BILINEAR),
+        # 步骤2：居中裁剪，确保尺寸严格统一为FIXED_FULL_SIZE
+        transforms.CenterCrop(FIXED_FULL_SIZE),
+        # 步骤3：常规转换（保持原有归一化）
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+
+
+def get_vis_full_transform():
+    """VIS 整图 Transform（核心修改：等比例缩放+居中裁剪，统一到FIXED_FULL_SIZE）"""
+    return transforms.Compose([
+        # 步骤1：等比例缩放，最短边达到固定尺寸，保持宽高比（避免拉伸）
+        transforms.Resize(FIXED_FULL_SIZE, interpolation=Image.BILINEAR),
+        # 步骤2：居中裁剪，确保尺寸严格统一为FIXED_FULL_SIZE
+        transforms.CenterCrop(FIXED_FULL_SIZE),
+        # 步骤3：常规转换（保持原有归一化）
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
 
-# ======================== Dataset（无修改） ========================
+# ======================== Dataset（核心优化：缓存文件路径+OpenCV加载+减少冗余IO） ========================
 class FusionDataset(Dataset):
-    def __init__(self, ir_dir, vis_dir, img_size, ir_transform=None, vis_transform=None):
+    def __init__(self, ir_dir, vis_dir, saliency_dir, ir_full_dir, vis_full_dir, patch_size,
+                 fixed_full_size=FIXED_FULL_SIZE,
+                 ir_transform=None, vis_transform=None, saliency_transform=None, 
+                 ir_full_transform=None, vis_full_transform=None,
+                 preload_full_images=True):
         self.ir_dir = ir_dir
         self.vis_dir = vis_dir
-        self.img_size = img_size
+        self.saliency_dir = saliency_dir
+        self.ir_full_dir = ir_full_dir
+        self.vis_full_dir = vis_full_dir
+        self.patch_size = patch_size
+        self.fixed_full_size = fixed_full_size
         self.ir_transform = ir_transform
         self.vis_transform = vis_transform
+        self.saliency_transform = saliency_transform
+        self.ir_full_transform = ir_full_transform
+        self.vis_full_transform = vis_full_transform
+        self.preload_full_images = preload_full_images
+        self.full_image_cache = {}
 
-        self.ir_filenames = [f for f in os.listdir(ir_dir) if os.path.splitext(f)[-1].lower() in IMG_SUFFIX]
-        self.vis_filenames = [f for f in os.listdir(vis_dir) if os.path.splitext(f)[-1].lower() in IMG_SUFFIX]
+        # ======================== 优化1：缓存文件完整路径，减少高频os.path.exists调用（解决IO瓶颈） ========================
+        self.ir_file_map = self._build_file_map(ir_dir)
+        self.vis_file_map = self._build_file_map(vis_dir)
+        self.saliency_file_map = self._build_file_map(saliency_dir)
 
-        self.common_filenames = list(set([os.path.splitext(f)[0] for f in self.ir_filenames]) &
-                                     set([os.path.splitext(f)[0] for f in self.vis_filenames]))
+        # 保留三者共同且符合"xxx_patch_xx_yy"格式的文件名
+        self.common_filenames = [
+            fname for fname in (self.ir_file_map.keys() & self.vis_file_map.keys() & self.saliency_file_map.keys())
+            if "_patch_" in fname
+        ]
         self.common_filenames.sort()
 
-        print(f"找到 {len(self.common_filenames)} 对有效图像")
+        if self.preload_full_images:
+            self._preload_all_full_images()
+
+        # 整图缓存初始化
+        self.cached_full_img_base = None
+        self.cached_ir_full_img = None
+        self.cached_vis_full_img = None
+        self.cached_original_full_size = None
+        self.cached_fixed_full_size = None
+
+        # 日志仅通过logger输出，移除print
         if len(self.common_filenames) == 0:
-            raise ValueError("未找到成对的红外/可见光图像！请检查文件名是否一致")
+            raise ValueError("未找到符合格式的成对红外/可见光/Saliency patch图像！请检查文件名是否为xxx_patch_xx_yy")
+    
+    def _preload_all_full_images(self):
+        """预加载所有整图到内存（消除训练时的 IO 瓶颈）"""
+        # 提取所有唯一的整图前缀
+        unique_bases = set()
+        for fname in self.common_filenames:
+            full_img_base, _, _ = self._parse_patch_info(fname)
+            unique_bases.add(full_img_base)
+        
+        print(f"正在预加载 {len(unique_bases)} 张整图到内存...")
+        for base in tqdm(unique_bases, desc="预加载整图"):
+            # 加载 IR 整图
+            ir_path = self._get_full_image_path(base, is_ir=True)
+            ir_img = cv2.imread(ir_path, cv2.IMREAD_GRAYSCALE)
+            ir_img_pil = Image.fromarray(ir_img)
+            ir_tensor = self.ir_full_transform(ir_img_pil)
+            
+            # 加载 VIS 整图
+            vis_path = self._get_full_image_path(base, is_ir=False)
+            vis_img = cv2.imread(vis_path)[:, :, ::-1]
+            vis_img_pil = Image.fromarray(vis_img)
+            vis_tensor = self.vis_full_transform(vis_img_pil)
+            
+            # 记录原始尺寸
+            orig_h, orig_w = ir_img.shape
+            
+            # 缓存
+            self.full_image_cache[base] = {
+                'ir_full': ir_tensor,
+                'vis_full': vis_tensor,
+                'original_size': (orig_h, orig_w),
+                'fixed_size': self.fixed_full_size
+            }
+        print(f"✅ 整图预加载完成，内存占用约 {len(unique_bases) * 512 * 512 * 4 / 1024 / 1024:.1f} MB")
+
+    # 新增：构建文件名→完整路径的映射，一次性遍历，避免重复IO
+    def _build_file_map(self, target_dir):
+        file_map = {}
+        for f in os.listdir(target_dir):
+            fname, fext = os.path.splitext(f)
+            if fext.lower() in IMG_SUFFIX:
+                file_map[fname] = os.path.join(target_dir, f)
+        return file_map
+
+    # 新增：获取样本文件名（用于分组打乱）
+    def get_filename(self, idx):
+        if idx < 0 or idx >= len(self.common_filenames):
+            raise IndexError("样本索引超出范围")
+        return self.common_filenames[idx]
+
+    def _parse_patch_info(self, patch_base_name):
+        """解析patch文件名，提取整图前缀和patch位置（保持原有逻辑）"""
+        parts = patch_base_name.split("_patch_")
+        if len(parts) != 2:
+            raise ValueError(f"无效的patch文件名格式：{patch_base_name}，应为xxx_patch_xx_yy")
+        
+        full_img_base = parts[0]
+        patch_xy = parts[1].split("_")
+        if len(patch_xy) != 2:
+            raise ValueError(f"无效的patch位置格式：{patch_base_name}，应为xxx_patch_xx_yy")
+        
+        patch_x = int(patch_xy[0])
+        patch_y = int(patch_xy[1])
+        return full_img_base, patch_x, patch_y
+
+    def _get_full_image_path(self, full_img_base, is_ir=True):
+        """根据整图前缀获取整图路径（保持原有逻辑）"""
+        target_dir = self.ir_full_dir if is_ir else self.vis_full_dir
+        for suffix in IMG_SUFFIX:
+            full_path = os.path.join(target_dir, full_img_base + suffix)
+            if os.path.exists(full_path):
+                return full_path
+        raise FileNotFoundError(f"未找到整图文件：{full_img_base}（在{target_dir}目录下）")
+
+    def _load_and_cache_full_images(self, full_img_base):
+        """
+        加载整图并更新缓存（核心修改：记录原始尺寸+固定尺寸，用于坐标缩放）
+        返回：ir_full_img（固定尺寸张量），vis_full_img（固定尺寸张量），
+              original_full_size（原始尺寸(H,W)），fixed_full_size（固定尺寸(H,W)）
+        """
+        # 1. 加载IR整图（原始尺寸）
+        ir_full_path = self._get_full_image_path(full_img_base, is_ir=True)
+        ir_full_img_pil_original = Image.open(ir_full_path).convert("L")
+        # 记录原始尺寸（PIL Image.size返回(W,H)，转换为(H,W)）
+        original_w, original_h = ir_full_img_pil_original.size
+        original_full_size = (original_h, original_w)
+        # 应用Transform（缩放为固定尺寸）
+        ir_full_img = self.ir_full_transform(ir_full_img_pil_original) if self.ir_full_transform else ir_full_img_pil_original
+        
+        # 2. 加载VIS整图（原始尺寸）
+        vis_full_path = self._get_full_image_path(full_img_base, is_ir=False)
+        vis_full_img_pil_original = Image.open(vis_full_path).convert("RGB")
+        # 应用Transform（缩放为固定尺寸）
+        vis_full_img = self.vis_full_transform(vis_full_img_pil_original) if self.vis_full_transform else vis_full_img_pil_original
+        
+        # 3. 记录固定尺寸（与配置一致）
+        fixed_full_size = self.fixed_full_size
+
+        # 4. 更新缓存
+        self.cached_full_img_base = full_img_base
+        self.cached_ir_full_img = ir_full_img
+        self.cached_vis_full_img = vis_full_img
+        self.cached_original_full_size = original_full_size
+        self.cached_fixed_full_size = fixed_full_size
+
+        return ir_full_img, vis_full_img, original_full_size, fixed_full_size
 
     def __len__(self):
         return len(self.common_filenames)
 
     def __getitem__(self, idx):
-        base_name = self.common_filenames[idx]
-        ir_path = None
-        vis_path = None
-        for suffix in IMG_SUFFIX:
-            if os.path.exists(os.path.join(self.ir_dir, base_name + suffix)):
-                ir_path = os.path.join(self.ir_dir, base_name + suffix)
-            if os.path.exists(os.path.join(self.vis_dir, base_name + suffix)):
-                vis_path = os.path.join(self.vis_dir, base_name + suffix)
+        # 1. 加载 patch（同步加载 IR/VIS/Saliency）
+        patch_base_name = self.common_filenames[idx]
+        ir_path = self.ir_file_map.get(patch_base_name)
+        vis_path = self.vis_file_map.get(patch_base_name)
+        saliency_path = self.saliency_file_map.get(patch_base_name)
 
-        ir_img = Image.open(ir_path).convert("L")
-        vis_img = Image.open(vis_path).convert("RGB")
+        # OpenCV 加载（保持原有逻辑）
+        ir_img = Image.fromarray(cv2.imread(ir_path, cv2.IMREAD_GRAYSCALE))
+        vis_img = Image.fromarray(cv2.imread(vis_path)[:, :, ::-1])
+        saliency_img = Image.fromarray(cv2.imread(saliency_path, cv2.IMREAD_GRAYSCALE))
 
         if self.ir_transform:
             ir_img = self.ir_transform(ir_img)
         if self.vis_transform:
             vis_img = self.vis_transform(vis_img)
+        if self.saliency_transform:
+            saliency_img = self.saliency_transform(saliency_img)
 
-        return {"ir": ir_img, "vis": vis_img, "filename": base_name}
+        # 2. 解析 patch 信息
+        full_img_base, patch_x, patch_y = self._parse_patch_info(patch_base_name)
 
+        # ✅ 改进：从内存缓存中读取整图（零 IO 开销）
+        if self.preload_full_images and full_img_base in self.full_image_cache:
+            cache = self.full_image_cache[full_img_base]
+            ir_full_img = cache['ir_full']
+            vis_full_img = cache['vis_full']
+            original_full_size = cache['original_size']
+            fixed_full_size = cache['fixed_size']
+        else:
+            # 回退到原有的缓存逻辑
+            if full_img_base != self.cached_full_img_base:
+                ir_full_img, vis_full_img, original_full_size, fixed_full_size = \
+                    self._load_and_cache_full_images(full_img_base)
+            else:
+                ir_full_img = self.cached_ir_full_img
+                vis_full_img = self.cached_vis_full_img
+                original_full_size = self.cached_original_full_size
+                fixed_full_size = self.cached_fixed_full_size
 
-# ======================== DataLoader（无修改） ========================
+        # 3. 计算 patch 坐标（保持原有逻辑）
+        patch_w, patch_h = self.patch_size
+        orig_h, orig_w = original_full_size
+        fixed_h, fixed_w = fixed_full_size
+
+        scale_w = fixed_w / orig_w
+        scale_h = fixed_h / orig_h
+
+        x1 = int(patch_x * patch_w * scale_w)
+        y1 = int(patch_y * patch_h * scale_h)
+        x2 = int((patch_x + 1) * patch_w * scale_w)
+        y2 = int((patch_y + 1) * patch_h * scale_h)
+
+        x1 = max(0, min(x1, fixed_w))
+        y1 = max(0, min(y1, fixed_h))
+        x2 = max(x1, min(x2, fixed_w))
+        y2 = max(y1, min(y2, fixed_h))
+
+        patch_pos = torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+        img_size = torch.tensor(fixed_full_size, dtype=torch.float32)
+
+        return {
+            "ir": ir_img, 
+            "vis": vis_img,
+            "saliency": saliency_img,
+            "ir_full": ir_full_img,
+            "vis_full": vis_full_img,
+            "patch_pos": patch_pos,
+            "img_size": img_size,
+            "filename": patch_base_name
+        }
+
+# ======================== 按整图分组打乱的包装Dataset ========================
+class ShuffledByImageDataset(Dataset):
+    """
+    包装现有FusionDataset，实现：
+    1. 按整图前缀分组（xxx_patch_xx_yy → xxx）
+    2. 组间打乱整图顺序（保证训练随机性）
+    3. 组内打乱patch顺序（可选，提升随机性且不影响缓存）
+    """
+    def __init__(self, original_dataset, shuffle_within_group=True):
+        self.original_dataset = original_dataset
+        self.shuffle_within_group = shuffle_within_group
+        self.shuffled_indices = self._create_shuffled_indices()
+
+    def _create_shuffled_indices(self):
+        """生成按整图分组打乱后的样本索引列表"""
+        # 步骤1：按整图前缀分组
+        image_to_indices = defaultdict(list)
+        for idx in range(len(self.original_dataset)):
+            filename = self.original_dataset.get_filename(idx)
+            full_img_base, _, _ = self.original_dataset._parse_patch_info(filename)
+            image_to_indices[full_img_base].append(idx)
+        
+        # 步骤2：组间打乱
+        image_ids = list(image_to_indices.keys())
+        random.shuffle(image_ids)
+
+        # 步骤3：组内打乱+拼接
+        shuffled_indices = []
+        for image_id in image_ids:
+            patch_indices = image_to_indices[image_id]
+            if self.shuffle_within_group:
+                random.shuffle(patch_indices)
+            shuffled_indices.extend(patch_indices)
+
+        return shuffled_indices
+
+    def __len__(self):
+        return len(self.shuffled_indices)
+
+    def __getitem__(self, idx):
+        """按打乱后的索引读取原始样本，保持返回格式一致"""
+        original_idx = self.shuffled_indices[idx]
+        return self.original_dataset[original_idx]
+
+# ======================== DataLoader（核心优化，清理无效参数） ========================
 def get_dataloader():
+    # Patch Transform
     ir_transform = get_ir_transform()
     vis_transform = get_vis_transform()
+    saliency_transform = get_saliency_transform()
 
+    # 整图Transform
+    ir_full_transform = get_ir_full_transform()
+    vis_full_transform = get_vis_full_transform()
+
+    # 目录配置
     ir_dir = os.path.join(DATA_ROOT, "Ir")
     vis_dir = os.path.join(DATA_ROOT, "Vis")
+    saliency_dir = SALIENCY_ROOT
+    ir_full_dir = os.path.join(FULL_IMAGE_ROOT, "ir")
+    vis_full_dir = os.path.join(FULL_IMAGE_ROOT, "vis")
 
-    dataset = FusionDataset(ir_dir, vis_dir, IMG_SIZE, ir_transform, vis_transform)
+    # 验证目录
+    for dir_path in [ir_dir, vis_dir, saliency_dir, ir_full_dir, vis_full_dir]:
+        if not os.path.exists(dir_path):
+            raise FileNotFoundError(f"目录不存在：{dir_path}")
 
-    num_workers = 0 if os.name == 'nt' else multiprocessing.cpu_count() // 2
+    # 加载原始FusionDataset（同步加载三者）
+    original_dataset = FusionDataset(
+        ir_dir=ir_dir,
+        vis_dir=vis_dir,
+        saliency_dir=saliency_dir,
+        ir_full_dir=ir_full_dir,
+        vis_full_dir=vis_full_dir,
+        patch_size=PATCH_SIZE,
+        fixed_full_size=FIXED_FULL_SIZE,
+        ir_transform=ir_transform,
+        vis_transform=vis_transform,
+        saliency_transform=saliency_transform,
+        ir_full_transform=ir_full_transform,
+        vis_full_transform=vis_full_transform,
+        preload_full_images=True  # ✅ 启用整图预加载
+    )
+
+    # 使用按整图分组打乱的包装类
+    dataset = ShuffledByImageDataset(
+        original_dataset=original_dataset,
+        shuffle_within_group=True
+    )
+
+    # ======================== 优化4：强制num_workers=0，清理多进程无效参数（解决内存瓶颈） ========================
+    num_workers = 0 if os.name == 'nt' else min(4, multiprocessing.cpu_count() // 2)
     dataloader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=True if num_workers > 0 else False,
-        drop_last=True
+        drop_last=True,
+        prefetch_factor=2 if num_workers > 0 else None,  # ✅ 预取 2 个 batch
+        persistent_workers=True if num_workers > 0 else False  # ✅ 保持 workers 常驻
     )
     return dataloader
 
 
-# ======================== 日志配置（简化：仅终端输出关键信息） ========================
+# ======================== 日志配置 ========================
 def init_logger():
-    """简化日志配置：仅输出到终端，不写详细loss到文件"""
+    """简化日志配置：仅输出到终端"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()]  # 仅控制台输出
+        handlers=[logging.StreamHandler()]
     )
     logger = logging.getLogger(__name__)
-    # 屏蔽不必要的第三方日志
     logging.getLogger('PIL').setLevel(logging.WARNING)
     logging.getLogger('torch').setLevel(logging.WARNING)
     return logger
 
 
-# ======================== TensorBoard初始化 ========================
+# ======================== 优化5：修正笔误（init_tb_writer，原少写一个'r'） ========================
 def init_tb_writer():
-    """初始化TensorBoard Writer，输出启动命令"""
+    """初始化TensorBoard Writer"""
     os.makedirs(TB_LOG_DIR, exist_ok=True)
     writer = SummaryWriter(log_dir=TB_LOG_DIR)
-    print(f"\n✅ TensorBoard日志目录：{os.path.abspath(TB_LOG_DIR)}")
-    print(f"✅ 启动命令：tensorboard --logdir={os.path.abspath(TB_LOG_DIR)} --port=6006")
     return writer
 
 
-# ======================== 训练类（核心修改：适配新Loss类） ========================
+# ======================== 训练类（核心优化：减少高频item()，批量迁移张量） ========================
 class FusionTrainer:
     def __init__(self, model, dataloader, logger):
         self.model = model.to(DEVICE)
         self.dataloader = dataloader
         self.logger = logger
 
-        # ======================== 新增：初始化自定义Loss模块 ========================
+        # 初始化自定义Loss模块（不再需要传入saliency_root，直接使用batch中的saliency）
         self.loss_module = Loss(
             device=DEVICE,
-            saliency_root=SALIENCY_ROOT,  # 预计算显著性图根目录
             grad_loss_type='l1',
             grad_reduction='mean'
         )
-        self.logger.info(f"✅ 自定义Loss模块初始化完成，显著性目录：{SALIENCY_ROOT}")
+        self.logger.info(f"✅ 自定义Loss模块初始化完成")
 
         # 梯度累积配置
         self.use_grad_accum = USE_GRAD_ACCUM
@@ -347,9 +538,8 @@ class FusionTrainer:
         self.logger.info(
             f"✅ 梯度累积: {self.use_grad_accum} (等效batch size: {BATCH_SIZE * self.grad_accum_steps})")
 
-        # ======================== 初始化TensorBoard ========================
+        # 初始化TensorBoard
         self.tb_writer = init_tb_writer()
-        # 可视化模型结构（跳过，避免字典输出报错）
         self.logger.info("✅ 跳过模型结构图可视化（避免字典输出trace报错）")
 
     def _load_checkpoint(self, path):
@@ -412,32 +602,30 @@ class FusionTrainer:
 
     def train_one_epoch(self, epoch):
         self.model.train()
-        total_loss = 0.0
-        # 新增：累计各细分损失
-        loss_metrics = {
-            "l1_vis": 0.0, "l1_ir": 0.0, "grad_loss": 0.0,
-            "perceptual_loss": 0.0, "style_loss": 0.0, "pvs_loss": 0.0,
-            "gradloss": 0.0, "intloss": 0.0, "maxintloss": 0.0,
-            "color_loss": 0.0
-        }
-
+        
+        # ✅ 改进：使用列表累积张量，而非标量累积
+        loss_tensors = []  # 存储每个 batch 的 loss tensor
+        loss_components = {k: [] for k in ["l1_vis", "l1_ir", "grad_loss", "perceptual_loss", 
+                                           "style_loss", "pvs_loss", "gradloss", "intloss", 
+                                           "maxintloss", "color_loss"]}
+        
         pbar = tqdm(self.dataloader, desc=f"Epoch [{epoch}/{EPOCHS}]")
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            img_ir = batch["ir"].to(DEVICE, non_blocking=True)
-            img_vis = batch["vis"].to(DEVICE, non_blocking=True)
-            # 关键：获取显著性标识（每个batch的第一个样本标识，或批量处理）
-            saliency_identifiers = batch["filename"]  # 使用整个batch的标识列表
+            # 批量迁移张量（保持你的优化）
+            batch = {k: v.to(DEVICE, non_blocking=True) if isinstance(v, torch.Tensor) else v 
+                     for k, v in batch.items()}
 
             # 混合精度前向传播
             with autocast(enabled=USE_MIXED_PRECISION):
-                outputs = self.model(img_ir, img_vis)
-                targets = {"img_vis": img_vis, "img_ir": img_ir}
-                # 核心修改：调用自定义Loss计算损失，传递显著性标识
-                losses = self.loss_module.forward(outputs, targets, saliency_identifiers)
-
-                # 梯度累积损失调整
+                outputs = self.model(
+                    batch["ir"], batch["vis"], 
+                    batch["ir_full"], batch["vis_full"], 
+                    batch["patch_pos"], batch["img_size"]
+                )
+                targets = {"img_vis": batch["vis"], "img_ir": batch["ir"]}
+                losses = self.loss_module.forward(outputs, targets, batch["saliency"])
                 loss = losses["total_loss"] / self.grad_accum_steps if self.use_grad_accum else losses["total_loss"]
 
             # 反向传播
@@ -463,38 +651,44 @@ class FusionTrainer:
                     self.optimizer.step()
                 self.optimizer.zero_grad()
 
-            # 每10轮保存一次图像样本到TensorBoard
+            # 图像样本保存
             if epoch % 10 == 0 and batch_idx == 0:
                 self._save_tb_image_samples(img_ir, img_vis, outputs, epoch)
 
-            # 累计损失
-            total_loss += losses["total_loss"].item()
+            # ✅ 关键改进：仅保存张量引用，避免 .item() 调用
+            loss_tensors.append(losses["total_loss"].detach())  # detach 避免计算图累积
+            for k in loss_components.keys():
+                if k in losses:
+                    loss_components[k].append(losses[k].detach())
 
-            # 进度条仅展示核心指标（简化输出）
-            pbar.set_postfix({
-                "total_loss": f"{losses['total_loss'].item():.4f}",
-                "lr": f"{self.optimizer.param_groups[0]['lr']:.6f}",
-                "grad_accum": f"{self.use_grad_accum}"
-            })
+            # ✅ 进度条显示：只在必要时调用 .item()（每 10 个 batch 更新一次）
+            if batch_idx % 10 == 0:
+                pbar.set_postfix({
+                    "loss": f"{losses['total_loss'].item():.4f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.6f}"
+                })
 
-        # 计算epoch平均损失
-        avg_loss = total_loss / len(self.dataloader)
-        avg_metrics = {k: v / len(self.dataloader) for k, v in loss_metrics.items()}
+        # ✅ Epoch 结束后批量计算平均值（仅一次 .item() 调用）
+        avg_loss = torch.stack(loss_tensors).mean().item()
+        avg_metrics = {k: torch.stack(v).mean().item() for k, v in loss_components.items() if v}
         current_lr = self.optimizer.param_groups[0]['lr']
 
-        # 写入TensorBoard（使用平均损失）
+        # TensorBoard 记录
         self.tb_writer.add_scalar("Loss/Total_Loss", avg_loss, epoch)
         for k, v in avg_metrics.items():
             self.tb_writer.add_scalar(f"Loss/{k}", v, epoch)
         self.tb_writer.add_scalar("Optimizer/Learning_Rate", current_lr, epoch)
         self.scheduler.step()
+        
         return avg_loss
 
     def train(self):
         self.logger.info("=" * 50)
         self.logger.info(f"训练开始！设备：{DEVICE}，批次大小：{BATCH_SIZE}，总轮次：{EPOCHS}")
         self.logger.info(f"模型参数：特征通道数={FEATURE_CHANNELS}，注意力头数={NUM_HEADS}")
-        self.logger.info(f"显著性图目录：{os.path.abspath(SALIENCY_ROOT)}")
+        self.logger.info(f"数据配置：Patch尺寸={PATCH_SIZE}，固定整图尺寸={FIXED_FULL_SIZE}")
+        self.logger.info(f"显著性图已在Dataset中同步加载")
+        self.logger.info(f"整图目录：{os.path.abspath(FULL_IMAGE_ROOT)}")
         self.logger.info(f"TensorBoard日志路径：{os.path.abspath(TB_LOG_DIR)}")
         self.logger.info("=" * 50)
 
@@ -511,22 +705,12 @@ class FusionTrainer:
         self.logger.info("=" * 50)
 
 
-# ======================== 入口函数（修改调试函数调用） ========================
+# ======================== 入口函数（移除所有多余print调试） ========================
 if __name__ == "__main__":
     # 初始化日志
     logger = init_logger()
     logger.info("加载数据集...")
     dataloader = get_dataloader()
-
-    # 验证通道数
-    for batch in dataloader:
-        print("验证img_ir通道数：", batch["ir"].shape)
-        print("验证img_vis通道数：", batch["vis"].shape)
-        print("验证filename标识：", batch["filename"][0])
-        break
-
-    # 数据范围调试
-    debug_data_range(dataloader)
 
     logger.info("初始化模型...")
     model = ImageFusionNetworkWithSourcePE(
@@ -536,18 +720,7 @@ if __name__ == "__main__":
         num_heads=NUM_HEADS,
         use_position_encoding=True
     )
-
     model = model.to(DEVICE)
-    print(f"模型已移动到设备: {DEVICE}")
-
-    # 初始化Loss模块用于调试
-    loss_module = Loss(
-        device=DEVICE,
-        saliency_root=SALIENCY_ROOT,
-    )
-
-    # 模型输出调试（传入Loss模块）
-    debug_model_outputs(model, dataloader, loss_module, DEVICE)
 
     # 启动训练
     trainer = FusionTrainer(model, dataloader, logger)
