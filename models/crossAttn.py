@@ -1,4 +1,4 @@
-from models.SourcePositionalEncoding import SourcePositionalEncoding2D
+from models.RotaryPositionEmbedding2D import RotaryPositionEmbedding2D
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,14 +6,8 @@ import torch.nn.functional as F
 # 保持原有ResidualCrossAttentionBlock完全不变（仅补充少量通道校验）
 class ResidualCrossAttentionBlock(nn.Module):
     """通用的残差交叉注意力块（未做核心修改，仅补充通道校验）"""
-    def __init__(self, hidden_size, num_heads=8, dropout=0.1, 
-                 q_channels=None, k_channels=None, v_channels=None):
-        """
-        参数说明：
-        - q_channels: query输入的通道数（如果为None，则使用hidden_size*2）
-        - k_channels: key输入的通道数（如果为None，则使用hidden_size*2）
-        - v_channels: value输入的通道数（如果为None，则使用hidden_size*2）
-        """
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1,
+                q_channels=None, k_channels=None, v_channels=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -22,12 +16,10 @@ class ResidualCrossAttentionBlock(nn.Module):
         self.k_channels = k_channels if k_channels is not None else hidden_size * 2
         self.v_channels = v_channels if v_channels is not None else hidden_size * 2
 
-        # 补充校验：确保head_dim*num_heads等于hidden_size*2（避免注意力维度不匹配）
         assert self.head_dim * self.num_heads == hidden_size * 2, \
             f"head_dim({self.head_dim}) * num_heads({self.num_heads}) must equal hidden_size*2({hidden_size*2})"
-        # 补充校验：确保q/k/v通道数为hidden_size*2（适配位置编码输出）
-        assert self.q_channels == hidden_size * 2 and self.k_channels == hidden_size * 2 and self.v_channels == hidden_size * 2, \
-            "q/k/v channels must equal hidden_size*2 for compatibility with positional encoding"
+        assert self.head_dim % 4 == 0, \
+            f"head_dim({self.head_dim}) must be a multiple of 4 for 2D RoPE"
 
         # 投影层（保持不变，适配hidden_size*2的通道数）
         self.w_q = nn.Linear(self.q_channels, hidden_size * 2, bias=True)
@@ -68,18 +60,12 @@ class ResidualCrossAttentionBlock(nn.Module):
         self.pos_encoding_k = pos_encoding_k
         self.pos_encoding_v = pos_encoding_v
     
-    def forward(self, fq, fk, fv, source_img_q, source_img_k, source_img_v, use_position_encoding=True):
+    def forward(self, fq, fk, fv, use_position_encoding=True):
         batch_size, c_q, h, w = fq.shape
         seq_len = h * w
         
         # 保存原始fq用于残差连接（保持不变）
         residual = fq.clone()
-        
-        # 步骤1：添加位置编码（适配SourcePositionalEncoding2D，保持逻辑不变）
-        if use_position_encoding and self.pos_encoding_q is not None:
-            fq = self.pos_encoding_q(fq, source_img_q)
-            fk = self.pos_encoding_k(fk, source_img_k)
-            fv = self.pos_encoding_v(fv, source_img_v)
         
         # 将特征重塑为序列（保持不变，确保维度对齐）
         fq_seq = fq.reshape(batch_size, c_q, seq_len).permute(0, 2, 1)
@@ -95,6 +81,10 @@ class ResidualCrossAttentionBlock(nn.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+        if use_position_encoding and self.pos_encoding_q is not None:
+            q = self.pos_encoding_q(q, h, w)
+            k = self.pos_encoding_k(k, h, w)
         
         # 注意力计算（保持不变，使用PyTorch原生Scaled Dot Product Attention）
         attn_output = F.scaled_dot_product_attention(
@@ -133,29 +123,23 @@ class ResidualCrossAttentionBlock(nn.Module):
 
 # 交叉注意力外层模块（修改：适配SourcePositionalEncoding2D，默认src通道为3）
 class MultiHeadCrossAttentionWithSourcePE(nn.Module):
-    def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True,
-                 src_q_channels=3, src_k_channels=3, src_v_channels=3, num_blocks=3):
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True, num_blocks=1
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.use_position_encoding = use_position_encoding
         self.num_blocks = num_blocks
-        
-        # 核心修改1：适配SourcePositionalEncoding2D的通道参数
-        # in_channels=src_*_channels（源图像通道，默认3，对应VIS图像）
-        # channels=hidden_size*2（特征通道，适配注意力模块的输出通道）
+
         if use_position_encoding:
-            self.pos_encoding_q = SourcePositionalEncoding2D(
-                in_channels=src_q_channels,
-                channels=hidden_size * 2
+            self.pos_encoding_q = RotaryPositionEmbedding2D(
+                head_dim = (hidden_size*2)//num_heads
             )
-            self.pos_encoding_k = SourcePositionalEncoding2D(
-                in_channels=src_k_channels,
-                channels=hidden_size * 2
+            self.pos_encoding_k = RotaryPositionEmbedding2D(
+                head_dim = (hidden_size*2)//num_heads
             )
-            self.pos_encoding_v = SourcePositionalEncoding2D(
-                in_channels=src_v_channels,
-                channels=hidden_size * 2
+            self.pos_encoding_v = RotaryPositionEmbedding2D(
+                head_dim = (hidden_size*2)//num_heads
             )
         else:
             self.pos_encoding_q = None
@@ -174,7 +158,6 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
                 v_channels=hidden_size * 2
             )
             
-            # 设置位置编码（所有块共享相同的位置编码，保持不变）
             if use_position_encoding:
                 block.set_position_encodings(
                     self.pos_encoding_q,
@@ -188,7 +171,7 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size * 2)
         self.final_dropout = nn.Dropout(dropout)
         
-    def forward(self, fq, fk, fv, source_img_q = None, source_img_k = None, source_img_v = None):
+    def forward(self, fq, fk, fv):
         # 保存原始输入用于最终残差连接（保持不变）
         original_input = fq.clone()
         
@@ -199,7 +182,6 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
         for i, block in enumerate(self.blocks):
             fq = block(
                 fq, fk, fv, 
-                source_img_q, source_img_k, source_img_v,
                 use_position_encoding=self.use_position_encoding
             )
             
@@ -227,21 +209,16 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
 # 自注意力外层模块（修改：适配SourcePositionalEncoding2D，默认src通道为3）
 class MultiHeadSelfAttentionWithSourcePE(nn.Module):
     """自注意力外层模块（基于ResidualCrossAttentionBlock实现，q=k=v）"""
-    def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True,
-                 src_channels=3, num_blocks=3):
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1, use_position_encoding=True, num_blocks=1):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.use_position_encoding = use_position_encoding
         self.num_blocks = num_blocks
         
-        # 核心修改2：适配SourcePositionalEncoding2D的通道参数
-        # 自注意力：q/k/v共享同一个位置编码，in_channels=src_channels（默认3，对应VIS图像）
-        # channels=hidden_size*2（特征通道，适配注意力模块的输出通道）
         if use_position_encoding:
-            self.pos_encoding = SourcePositionalEncoding2D(
-                in_channels=src_channels,
-                channels=hidden_size * 2
+            self.pos_encoding = RotaryPositionEmbedding2D(
+                head_dim = (hidden_size*2)//num_heads
             )
         else:
             self.pos_encoding = None
@@ -272,12 +249,11 @@ class MultiHeadSelfAttentionWithSourcePE(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size * 2)
         self.final_dropout = nn.Dropout(dropout)
         
-    def forward(self, x, source_img=None):
+    def forward(self, x):
         """
         自注意力前向传播：q=k=v=x（保持调用逻辑不变，适配主模型）
         参数：
         - x: 输入张量，形状 (batch_size, c, h, w)
-        - source_img: 位置编码所需的原始图像，可选
         返回：
         - output: 输出张量（形状与x完全一致）
         - intermediate_outputs: 训练时返回中间块输出，测试时返回None
@@ -292,9 +268,6 @@ class MultiHeadSelfAttentionWithSourcePE(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(
                 fq=x, fk=x, fv=x,  # 关键：q=k=v=x
-                source_img_q=source_img, 
-                source_img_k=source_img, 
-                source_img_v=source_img,
                 use_position_encoding=self.use_position_encoding
             )
             
