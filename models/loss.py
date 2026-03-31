@@ -53,7 +53,7 @@ class Loss(nn.Module):
                  # 拆分后的gradloss/intloss独立权重
                  lambda_gradloss=1.0,
                  lambda_grad_en=0,
-                 lambda_intloss=0,
+                 lambda_intloss=1.0,
                  lambda_maxintloss=1.0,
                  # 原有颜色损失权重（颜色一致性）
                  lambda_color=0,
@@ -768,10 +768,15 @@ class Loss(nn.Module):
         pred_fusion = outputs["img_fusion_pred"]
         target_vis = targets["img_vis"]
         target_ir = targets["img_ir"]
+        #pred_vis_decouple = outputs["img_vis_pred_decoup"]
+        #pred_ir_decouple = outputs["img_ir_pred_decoup"]
 
         # 1. 计算基础L1损失
         l1_vis = self._compute_l1_vis(pred_vis, target_vis)
         l1_ir = self._compute_l1_ir(pred_ir, target_ir)
+
+        #l1_vis_decouple = self._compute_l1_vis(pred_vis_decouple, target_vis)
+        #l1_ir_decouple = self._compute_l1_ir(pred_ir_decouple, target_ir)
 
         # 2. 调用修正后的intloss和maxintloss
         intloss = self._compute_intloss(pred_fusion, target_vis, target_ir)
@@ -804,6 +809,8 @@ class Loss(nn.Module):
         total_loss = (
             self.lambda_dict['vis'] * l1_vis +
             self.lambda_dict['ir'] * l1_ir +
+            #self.lambda_dict['vis'] * l1_vis_decouple +
+            #self.lambda_dict['ir'] * l1_ir_decouple +
             self.lambda_dict['gradloss'] * gradloss +
             self.lambda_dict['intloss'] * intloss +
             self.lambda_dict['maxintloss'] * maxintloss +
