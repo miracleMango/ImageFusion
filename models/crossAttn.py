@@ -133,7 +133,7 @@ class MultiHeadCrossAttentionWithSourcePE(nn.Module):
 
         if use_position_encoding:
             self.pos_encoding_q = RotaryPositionEmbedding2D(
-                head_dim = (hidden_size*2)//num_heads
+                head_dim = (hidden_size*2)//num_heads,
             )
             self.pos_encoding_k = RotaryPositionEmbedding2D(
                 head_dim = (hidden_size*2)//num_heads
