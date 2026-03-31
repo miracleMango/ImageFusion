@@ -12,6 +12,7 @@ class EnhancedAttention(nn.Module):
         self.reduction = reduction
         mid_channels = in_channels // reduction
 
+
         # ========== 分支1：全局池化分支 ==========
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.global_fc = nn.Sequential(
@@ -47,7 +48,7 @@ class EnhancedAttention(nn.Module):
         # ========== 分支4：残差分支 ==========
         # 残差分支无需额外层，仅需为其分配融合权重
         # ========== 四分支融合权重 ==========
-        self.fusion_weight = nn.Parameter(torch.ones(4) / 4)  # 初始均等权重：[1/4, 1/4, 1/4, 1/4]
+        self.fusion_weight = nn.Parameter(torch.ones(3) / 3)  # 初始均等权重：[1/4, 1/4, 1/4, 1/4]
         self.softmax = nn.Softmax(dim=0)
 
     def axial_self_attention(self, x):
@@ -86,21 +87,16 @@ class EnhancedAttention(nn.Module):
         # 分支3：轴向自注意力权重
         axial_weight = self.axial_self_attention(x)
 
-        # 分支4：残差分支权重
-        # 残差分支权重为全1（代表原始特征无衰减），形状与其他分支一致：(B, C, 1, 1)
-        residual_weight = torch.ones(b, c, 1, 1).to(x.device)
-
         # 四分支融合
-        fusion_weights = self.softmax(self.fusion_weight)  # 归一化4个权重，和为1
+        fusion_weights = self.softmax(self.fusion_weight)  # 归一化3个权重，和为1
         final_weight = (
             fusion_weights[0] * global_weight +
             fusion_weights[1] * local_weight +
-            fusion_weights[2] * axial_weight +
-            fusion_weights[3] * residual_weight  # 新增残差分支的加权
+            fusion_weights[2] * axial_weight
         )
 
         # 注意力加权：原始特征 × 融合后的权重
-        return x * final_weight
+        return x * final_weight + x
 
 class Block(nn.Module):
     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
