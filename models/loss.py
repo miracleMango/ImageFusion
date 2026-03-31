@@ -46,6 +46,7 @@ class Loss(nn.Module):
                  # 基础损失权重
                  lambda_vis=1.0,
                  lambda_ir=1.0,
+                 lambda_Orth = 0.5,
                  lambda_perceptual=0,
                  lambda_gradient=0,
                  lambda_style=0,
@@ -53,7 +54,7 @@ class Loss(nn.Module):
                  # 拆分后的gradloss/intloss独立权重
                  lambda_gradloss=1.0,
                  lambda_grad_en=0,
-                 lambda_intloss=1.0,
+                 lambda_intloss=2.0,
                  lambda_maxintloss=1.0,
                  # 原有颜色损失权重（颜色一致性）
                  lambda_color=0,
@@ -75,6 +76,7 @@ class Loss(nn.Module):
         self.lambda_dict = {
             'vis': lambda_vis,
             'ir': lambda_ir,
+            'Orth': lambda_Orth,
             'perceptual': lambda_perceptual,
             'gradient': lambda_gradient,
             'style': lambda_style,
@@ -755,6 +757,34 @@ class Loss(nn.Module):
 
         return torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 
+    def _compute_ortho_loss(self, outputs):
+        """
+        正交损失：
+        表面：约束 vis/ir exclusive 特征与对方模态特征余弦相似度趋向0
+        本质：反向迫使 F_fusion 与 F_ir/F_vis 特征空间对齐，
+            使减法解耦在通道语义上有意义
+        """
+        if self.lambda_dict['Orth'] == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        features = outputs["features"]
+        vis_excl = features["vis_exclusive_feature"]  # F_fusion - F_ir
+        ir_excl  = features["ir_exclusive_feature"]   # F_fusion - F_vis
+        fir      = features["fir"]
+        fvis     = features["fvis"]
+
+        vis_excl_flat = vis_excl.flatten(2)  # [B, C, H*W]
+        ir_excl_flat  = ir_excl.flatten(2)
+        fir_flat      = fir.flatten(2)
+        fvis_flat     = fvis.flatten(2)
+
+        # (F_fusion - F_ir) ⊥ F_ir → 迫使 F_fusion 与 F_ir 对齐
+        cos_vis = F.cosine_similarity(vis_excl_flat, fir_flat, dim=2).abs().mean()
+
+        # (F_fusion - F_vis) ⊥ F_vis → 迫使 F_fusion 与 F_vis 对齐
+        cos_ir  = F.cosine_similarity(ir_excl_flat, fvis_flat, dim=2).abs().mean()
+
+        return cos_vis + cos_ir
     # ========== 修改后前向传播：集成Canny边缘损失 ==========
     def forward(self, outputs, targets):
         """
@@ -768,15 +798,12 @@ class Loss(nn.Module):
         pred_fusion = outputs["img_fusion_pred"]
         target_vis = targets["img_vis"]
         target_ir = targets["img_ir"]
-        #pred_vis_decouple = outputs["img_vis_pred_decoup"]
-        #pred_ir_decouple = outputs["img_ir_pred_decoup"]
 
         # 1. 计算基础L1损失
         l1_vis = self._compute_l1_vis(pred_vis, target_vis)
         l1_ir = self._compute_l1_ir(pred_ir, target_ir)
 
-        #l1_vis_decouple = self._compute_l1_vis(pred_vis_decouple, target_vis)
-        #l1_ir_decouple = self._compute_l1_ir(pred_ir_decouple, target_ir)
+        OrthLoss = self._compute_ortho_loss(outputs)
 
         # 2. 调用修正后的intloss和maxintloss
         intloss = self._compute_intloss(pred_fusion, target_vis, target_ir)
@@ -809,8 +836,7 @@ class Loss(nn.Module):
         total_loss = (
             self.lambda_dict['vis'] * l1_vis +
             self.lambda_dict['ir'] * l1_ir +
-            #self.lambda_dict['vis'] * l1_vis_decouple +
-            #self.lambda_dict['ir'] * l1_ir_decouple +
+            self.lambda_dict['Orth'] * OrthLoss +
             self.lambda_dict['gradloss'] * gradloss +
             self.lambda_dict['intloss'] * intloss +
             self.lambda_dict['maxintloss'] * maxintloss +
@@ -831,6 +857,7 @@ class Loss(nn.Module):
             "total_loss": total_loss,
             "l1_vis": l1_vis,
             "l1_ir": l1_ir,
+            "OrthLoss": OrthLoss,
             "grad_loss": grad_loss,
             "perceptual_loss": perceptual_loss,
             "style_loss": style_loss,
